@@ -6,8 +6,8 @@ import tensorflow as tf
 import numpy as np
 from collections import namedtuple
 
-from module import *
-from utils import *
+from .module import *
+from .utils import *
 
 
 class cyclegan(object):
@@ -19,6 +19,7 @@ class cyclegan(object):
         self.output_c_dim = args.output_nc
         self.L1_lambda = args.L1_lambda
         self.dataset_dir = args.dataset_dir
+        self.checkpoint_dir = args.checkpoint_dir
 
         self.discriminator = discriminator
         if args.use_resnet:
@@ -37,7 +38,7 @@ class cyclegan(object):
                                       args.phase == 'train'))
 
         self._build_model()
-        self.saver = tf.train.Saver()
+        self.saver = tf.train.Saver(max_to_keep=1000)
         self.pool = ImagePool(args.max_size)
 
     def _build_model(self):
@@ -116,6 +117,51 @@ class cyclegan(object):
         self.d_vars = [var for var in t_vars if 'discriminator' in var.name]
         self.g_vars = [var for var in t_vars if 'generator' in var.name]
         for var in t_vars: print(var.name)
+    def input_fn(self):
+      dataA = glob('{}/*.*'.format(self.dataset_dir + '/trainA'))
+      dataB = glob('{}/*.*'.format(self.dataset_dir + '/trainB'))
+      np.random.shuffle(dataA)
+      np.random.shuffle(dataB)
+      batch_idxs = min(min(len(dataA), len(dataB)), args.train_size) // self.batch_size
+      
+    def horovod_train(self, args):
+      """Train cyclegan"""
+      hvd.init()
+      config = tf.ConfigProto()
+      config.gpu_options.visible_device_list = str(hvd.local_rank())
+
+      self.lr = tf.placeholder(tf.float32, None, name='learning_rate')
+      d_opt = tf.train.AdamOptimizer(self.lr * hvd.size(), beta1=args.beta1)
+      g_opt = tf.train.AdamOptimizer(self.lr * hvd.size(), beta1=args.beta1) \
+
+      d_opt = hvd.DistributedOptimizer(d_opt)
+      g_opt = hvd.DistributedOptimizer(g_opt)
+
+      hooks = [hvd.BroadcastGlobalVariablesHook(0)]
+
+      self.d_optim = d_opt.minimize(self.d_loss, var_list=self.d_vars)
+      self.g_optim = g_opt.minimize(self.g_loss, var_list=self.g_vars)
+
+      checkpoint_dir = self.checkpoint_dir if hvd.rank() == 0 else None
+      with tf.train.MonitoredTrainingSession(
+        checkpoint_dir=checkpoint_dir, config=config, hooks=hooks) as mon_sess:
+        while not mon_sess.should_stop():
+          mon_sess.run()
+
+      #init_op = tf.global_variables_initializer()
+      #self.sess.run(init_op)
+      #self.writer = tf.summary.FileWriter("./logs", self.sess.graph)
+
+      #counter = 1
+      #start_time = time.time()
+
+      if args.continue_train:
+          if self.load(args.checkpoint_dir):
+              print(" [*] Load SUCCESS")
+          else:
+              print(" [!] Load failed...")
+
+
 
     def train(self, args):
         """Train cyclegan"""
@@ -137,10 +183,11 @@ class cyclegan(object):
                 print(" [*] Load SUCCESS")
             else:
                 print(" [!] Load failed...")
+        global_step = tf.train.get_or_create_global_step()
 
         for epoch in range(args.epoch):
-            dataA = glob('./datasets/{}/*.*'.format(self.dataset_dir + '/trainA'))
-            dataB = glob('./datasets/{}/*.*'.format(self.dataset_dir + '/trainB'))
+            dataA = glob('{}/*.*'.format(self.dataset_dir + '/trainA'))
+            dataB = glob('{}/*.*'.format(self.dataset_dir + '/trainB'))
             np.random.shuffle(dataA)
             np.random.shuffle(dataB)
             batch_idxs = min(min(len(dataA), len(dataB)), args.train_size) // self.batch_size
@@ -161,12 +208,13 @@ class cyclegan(object):
 
                 # Update D network
                 _, summary_str = self.sess.run(
-                    [self.d_optim, self.d_sum],
+                    [self.d_optim, self.d_sum, global_step],
                     feed_dict={self.real_data: batch_images,
                                self.fake_A_sample: fake_A,
                                self.fake_B_sample: fake_B,
                                self.lr: lr})
-                self.writer.add_summary(summary_str, counter)
+                self.writer.add_summary(summary_str, global_step)
+                #self.writer.add_summary(summary_str, counter)
 
                 counter += 1
                 print(("Epoch: [%2d] [%4d/%4d] time: %4.4f" % (
@@ -176,12 +224,14 @@ class cyclegan(object):
                     self.sample_model(args.sample_dir, epoch, idx)
 
                 if np.mod(counter, args.save_freq) == 2:
-                    self.save(args.checkpoint_dir, counter)
+                    self.save(args.checkpoint_dir, global_step)
 
     def save(self, checkpoint_dir, step):
         model_name = "cyclegan.model"
-        model_dir = "%s_%s" % (self.dataset_dir, self.image_size)
-        checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
+        # model_dir = "%s_%s" % (self.checkpoint_dir, self.image_size)
+        # model_dir = "%s" % (self.checkpoint_dir)
+        # checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
+        checkpoint_dir = self.checkpoint_dir
 
         if not os.path.exists(checkpoint_dir):
             os.makedirs(checkpoint_dir)
@@ -192,9 +242,11 @@ class cyclegan(object):
 
     def load(self, checkpoint_dir):
         print(" [*] Reading checkpoint...")
-
-        model_dir = "%s_%s" % (self.dataset_dir, self.image_size)
-        checkpoint_dir = os.path.join(checkpoint_dir, model_dir)
+        # model_dir = "%s_%s" % (self.checkpoint_dir, self.image_size)
+        #checkpoint_dir = os.path.join(self.checkpoint_dir, model_dir)
+        # checkpoint_dir = model_dir
+        # print('>>>', checkpoint_dir)
+        checkpoint_dir = self.checkpoint_dir
 
         ckpt = tf.train.get_checkpoint_state(checkpoint_dir)
         if ckpt and ckpt.model_checkpoint_path:
@@ -205,12 +257,14 @@ class cyclegan(object):
             return False
 
     def sample_model(self, sample_dir, epoch, idx):
-        dataA = glob('./datasets/{}/*.*'.format(self.dataset_dir + '/testA'))
-        dataB = glob('./datasets/{}/*.*'.format(self.dataset_dir + '/testB'))
+        dataA = glob('{}/*.*'.format(self.dataset_dir + '/testA'))
+        dataB = glob('{}/*.*'.format(self.dataset_dir + '/testB'))
         np.random.shuffle(dataA)
         np.random.shuffle(dataB)
         batch_files = list(zip(dataA[:self.batch_size], dataB[:self.batch_size]))
-        sample_images = [load_train_data(batch_file, is_testing=True) for batch_file in batch_files]
+        # sample_images = [load_train_data(batch_file, is_testing=True) for batch_file in batch_files]
+        sample_images = [load_train_data(
+          batch_file, is_testing=True, load_size=self.image_size, fine_size=self.image_size) for batch_file in batch_files]
         sample_images = np.array(sample_images).astype(np.float32)
 
         fake_A, fake_B = self.sess.run(
@@ -227,9 +281,9 @@ class cyclegan(object):
         init_op = tf.global_variables_initializer()
         self.sess.run(init_op)
         if args.which_direction == 'AtoB':
-            sample_files = glob('./datasets/{}/*.*'.format(self.dataset_dir + '/testA'))
+            sample_files = glob('{}/*.*'.format(self.dataset_dir + '/testA'))
         elif args.which_direction == 'BtoA':
-            sample_files = glob('./datasets/{}/*.*'.format(self.dataset_dir + '/testB'))
+            sample_files = glob('{}/*.*'.format(self.dataset_dir + '/testB'))
         else:
             raise Exception('--which_direction must be AtoB or BtoA')
 

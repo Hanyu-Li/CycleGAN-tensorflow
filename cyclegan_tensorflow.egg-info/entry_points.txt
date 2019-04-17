@@ -1,0 +1,3 @@
+[console_scripts]
+cyclegan = cyclegan_tensorflow.main:main
+

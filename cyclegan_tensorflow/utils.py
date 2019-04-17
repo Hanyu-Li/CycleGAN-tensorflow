@@ -43,14 +43,15 @@ class ImagePool(object):
             return image
 
 def load_test_data(image_path, fine_size=256):
-    img = imread(image_path)
+    img = imread(image_path, is_grayscale=True)
     img = scipy.misc.imresize(img, [fine_size, fine_size])
+    img = np.expand_dims(img, -1)
     img = img/127.5 - 1
     return img
 
 def load_train_data(image_path, load_size=286, fine_size=256, is_testing=False):
-    img_A = imread(image_path[0])
-    img_B = imread(image_path[1])
+    img_A = imread(image_path[0], is_grayscale=True)
+    img_B = imread(image_path[1], is_grayscale=True)
     if not is_testing:
         img_A = scipy.misc.imresize(img_A, [load_size, load_size])
         img_B = scipy.misc.imresize(img_B, [load_size, load_size])
@@ -69,7 +70,8 @@ def load_train_data(image_path, load_size=286, fine_size=256, is_testing=False):
     img_A = img_A/127.5 - 1.
     img_B = img_B/127.5 - 1.
 
-    img_AB = np.concatenate((img_A, img_B), axis=2)
+    # img_AB = np.concatenate((img_A, img_B), axis=2)
+    img_AB = np.stack((img_A, img_B), axis=2)
     # img_AB shape: (fine_size, fine_size, input_c_dim + output_c_dim)
     return img_AB
 
